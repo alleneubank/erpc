@@ -1296,9 +1296,8 @@ func TestBootstrapTask_SupersededAttemptCannotFinishNextAttempt(t *testing.T) {
 	}
 }
 
-// A failed attempt sets its terminal state before storing its error, so Wait
-// can observe the state while lastErr still holds the attempt-start nil. It
-// must still report a failure.
+// A retry can clear lastErr after Wait read a failed state, so Wait can
+// observe the state with no error. It must still report a failure.
 func TestBootstrapTask_WaitTerminalFailureWithoutErrorIsError(t *testing.T) {
 	for _, st := range []TaskState{TaskFailed, TaskTimedOut, TaskFatal} {
 		bt := NewBootstrapTask("t", nil)
@@ -1339,4 +1338,66 @@ func TestInitializer_CancelledAppCtxDoesNotWedge(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Stop hung on tasksMu")
 	}
+}
+
+// runningAttemptWithBlockingCancel starts an attempt of a new task in init
+// whose cancellation blocks until release closes. cancelling closes once the
+// attempt is being cancelled.
+func runningAttemptWithBlockingCancel(t *testing.T, init *Initializer, name string) (task *BootstrapTask, cancelling, release chan struct{}) {
+	t.Helper()
+	task = NewBootstrapTask(name, nil)
+	_, started := task.startAttempt(TaskPending)
+	require.True(t, started)
+	task.createNewDoneChannel()
+	cancelling = make(chan struct{})
+	release = make(chan struct{})
+	task.ctxCancel.Store(context.CancelFunc(func() {
+		close(cancelling)
+		<-release
+	}))
+	init.tasks.Store(task.Name, task)
+	return task, cancelling, release
+}
+
+// MarkTaskAsFailed cancels the running attempt. A waiter woken by that
+// cancellation must already see the supplied error.
+func TestInitializer_MarkTaskAsFailedPublishesErrorBeforeCancelling(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	init := setupInitializer(t, ctx, &InitializerConfig{TaskTimeout: time.Minute})
+	task, cancelling, release := runningAttemptWithBlockingCancel(t, init, "marked")
+	defer close(release)
+
+	want := errors.New("critical connection failure")
+	go init.MarkTaskAsFailed(task.Name, want)
+	select {
+	case <-cancelling:
+	case <-ctx.Done():
+		t.Fatal("MarkTaskAsFailed did not cancel the running attempt")
+	}
+
+	require.ErrorIs(t, task.Wait(ctx), want)
+	require.ErrorIs(t, init.Errors(), want)
+}
+
+// The reaper times out an overdue attempt. Its timeout must be published
+// before the attempt is cancelled, so the cancelled attempt's own result
+// cannot replace it.
+func TestInitializer_ReapPublishesTimeoutBeforeCancelling(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	init := setupInitializer(t, ctx, &InitializerConfig{TaskTimeout: time.Second})
+	task, cancelling, release := runningAttemptWithBlockingCancel(t, init, "overdue")
+	defer close(release)
+	task.lastAttempt.Store(time.Now().Add(-2 * time.Second))
+
+	go init.reapOverdueRunningTasks()
+	select {
+	case <-cancelling:
+	case <-ctx.Done():
+		t.Fatal("the reaper did not cancel the overdue attempt")
+	}
+
+	require.Equal(t, TaskTimedOut, TaskState(task.state.Load()))
+	require.ErrorIs(t, task.Wait(ctx), context.DeadlineExceeded)
 }

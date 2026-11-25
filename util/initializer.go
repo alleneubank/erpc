@@ -55,6 +55,7 @@ type BootstrapTask struct {
 	attempts    atomic.Int32
 	// attemptMu makes "claim Running + bump attempts" and "check attempt id +
 	// leave Running" atomic, so a superseded attempt cannot finish the next one.
+	// Every write of state holds it.
 	attemptMu sync.Mutex
 }
 
@@ -110,9 +111,8 @@ func (t *BootstrapTask) Wait(ctx context.Context) error {
 				return lastErr.err
 			}
 			if state != TaskSucceeded {
-				// The terminal state is set before its error is stored, so a
-				// failure can be observed with no error yet. Never report it
-				// as success.
+				// A retry can start, clearing the error, between the state
+				// read and the error read. Never report that as success.
 				return fmt.Errorf("task %s %s without a recorded error", t.Name, state)
 			}
 			return nil
@@ -155,6 +155,7 @@ func (t *BootstrapTask) startAttempt(from TaskState) (int32, bool) {
 	if !t.state.CompareAndSwap(int32(from), int32(TaskRunning)) {
 		return 0, false
 	}
+	t.lastErr.Store(wrappedError{err: nil})
 	t.lastAttempt.Store(time.Now())
 	return t.attempts.Add(1), true
 }
@@ -164,15 +165,21 @@ func (t *BootstrapTask) startAttempt(from TaskState) (int32, bool) {
 func (t *BootstrapTask) finishAttempt(attemptID int32, terminal TaskState, err error) bool {
 	t.attemptMu.Lock()
 	defer t.attemptMu.Unlock()
-	if t.attempts.Load() != attemptID {
+	if t.attempts.Load() != attemptID || TaskState(t.state.Load()) != TaskRunning {
 		return false
 	}
-	// #nosec G115 - We know TaskState is small enough that int->int32 won't overflow
-	if !t.state.CompareAndSwap(int32(TaskRunning), int32(terminal)) {
-		return false
-	}
-	t.lastErr.Store(wrappedError{err: err})
+	t.publishLocked(terminal, err)
 	return true
+}
+
+// publishLocked moves the task to state with err as its error and returns the
+// previous state. The caller holds attemptMu. err is stored before state:
+// Wait reads state and then lastErr, so a reader that sees state also sees
+// err.
+func (t *BootstrapTask) publishLocked(state TaskState, err error) TaskState {
+	t.lastErr.Store(wrappedError{err: err})
+	// #nosec G115 - We know TaskState is small enough that int->int32 won't overflow
+	return TaskState(t.state.Swap(int32(state)))
 }
 
 type InitializerConfig struct {
@@ -402,8 +409,6 @@ func (i *Initializer) attemptRemainingTasks(respectBackoff bool) {
 			}
 			// Attempt to swap from [Pending|Failed|Timeout] -> Running
 			if attemptID, ok := t.startAttempt(state); ok {
-				t.lastErr.Store(wrappedError{err: nil})
-
 				// Create a fresh done channel to signal this attempt's completion
 				doneCh := t.createNewDoneChannel()
 				tasksToRun = append(tasksToRun, t)
@@ -570,23 +575,27 @@ func (i *Initializer) reapOverdueRunningTasks() {
 	now := time.Now()
 	i.tasks.Range(func(_, value interface{}) bool {
 		t := value.(*BootstrapTask)
-		if TaskState(t.state.Load()) != TaskRunning {
-			return true
-		}
+		t.attemptMu.Lock()
 		lastAttempt, _ := t.lastAttempt.Load().(time.Time)
-		if lastAttempt.IsZero() || now.Sub(lastAttempt) < i.conf.TaskTimeout {
+		overdue := TaskState(t.state.Load()) == TaskRunning &&
+			!lastAttempt.IsZero() && now.Sub(lastAttempt) >= i.conf.TaskTimeout
+		if overdue {
+			t.publishLocked(TaskTimedOut, context.DeadlineExceeded)
+			// Cancelled after the timeout is published, so the attempt's own
+			// result cannot replace it, and under attemptMu, so no retry
+			// starts before the attempt is cancelled.
+			if cancel, _ := t.ctxCancel.Load().(context.CancelFunc); cancel != nil {
+				cancel()
+			}
+		}
+		t.attemptMu.Unlock()
+		if !overdue {
 			return true
 		}
-		if cancel, ok := t.ctxCancel.Load().(context.CancelFunc); ok && cancel != nil {
-			cancel()
-		}
-		if t.state.CompareAndSwap(int32(TaskRunning), int32(TaskTimedOut)) {
-			t.lastErr.Store(wrappedError{err: context.DeadlineExceeded})
-			i.logger.Warn().
-				Str("task", t.Name).
-				Dur("runningFor", now.Sub(lastAttempt)).
-				Msg("initialization task timed out while still running; reaped for retry")
-		}
+		i.logger.Warn().
+			Str("task", t.Name).
+			Dur("runningFor", now.Sub(lastAttempt)).
+			Msg("initialization task timed out while still running; reaped for retry")
 		return true
 	})
 }
@@ -616,13 +625,16 @@ func (i *Initializer) MarkTaskAsFailed(name string, err error) {
 	i.tasks.Range(func(key, value interface{}) bool {
 		t := value.(*BootstrapTask)
 		if t.Name == name {
-			previousState := TaskState(t.state.Swap(int32(TaskFailed)))
-			if previousState == TaskRunning {
-				if ctxCancel, ok := t.ctxCancel.Load().(context.CancelFunc); ok && ctxCancel != nil {
-					ctxCancel()
+			t.attemptMu.Lock()
+			defer t.attemptMu.Unlock()
+			// Cancelled after err is published, so the attempt's waiters,
+			// woken by the cancellation, report err, and under attemptMu, so
+			// no retry starts before the attempt is cancelled.
+			if t.publishLocked(TaskFailed, err) == TaskRunning {
+				if cancel, _ := t.ctxCancel.Load().(context.CancelFunc); cancel != nil {
+					cancel()
 				}
 			}
-			t.lastErr.Store(wrappedError{err: err})
 			return false
 		}
 		return true
